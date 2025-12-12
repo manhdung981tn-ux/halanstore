@@ -15,10 +15,12 @@ import {
   MoreHorizontal,
   CheckCircle,
   Plus,
-  Trash2
+  Trash2,
+  RefreshCw,
+  Cloud
 } from 'lucide-react';
 import { Product, ProductFormData, AppSettings, CartItem, Order, Employee } from './types';
-import { generateId, formatCurrency, syncOrderToGoogleSheet } from './utils';
+import { generateId, formatCurrency, syncOrderToGoogleSheet, syncProductToGoogleSheet, fetchFromGoogleSheet } from './utils';
 import { ProductCard } from './components/ProductCard';
 import { ProductModal } from './components/ProductModal';
 import { ProductDetailModal } from './components/ProductDetailModal';
@@ -35,6 +37,7 @@ import { Toast, ToastType } from './components/Toast';
 const STORAGE_KEY = 'halan_buslines_store_data';
 const SETTINGS_KEY = 'halan_buslines_settings';
 const ORDERS_KEY = 'halan_buslines_orders';
+const CART_KEY = 'halan_buslines_cart_draft';
 
 // Dummy data for initial load - Customized for Buslines
 const INITIAL_DATA: Product[] = [
@@ -117,6 +120,7 @@ const App: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState('');
   
   const [isLoading, setIsLoading] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
 
   // Toast State
   const [toast, setToast] = useState<{ message: string; type: ToastType } | null>(null);
@@ -132,6 +136,7 @@ const App: React.FC = () => {
         const storedProducts = localStorage.getItem(STORAGE_KEY);
         const storedSettings = localStorage.getItem(SETTINGS_KEY);
         const storedOrders = localStorage.getItem(ORDERS_KEY);
+        const storedCart = localStorage.getItem(CART_KEY);
 
         if (storedProducts) setProducts(JSON.parse(storedProducts));
         else setProducts(INITIAL_DATA);
@@ -149,6 +154,7 @@ const App: React.FC = () => {
             });
         }
         if (storedOrders) setOrders(JSON.parse(storedOrders));
+        if (storedCart) setCart(JSON.parse(storedCart));
 
       } catch (error) {
         console.error("Load data error", error);
@@ -160,17 +166,42 @@ const App: React.FC = () => {
     loadData();
   }, []);
 
-  // Save data
+  // Save data locally
   useEffect(() => {
     if (!isLoading) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(products));
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
       localStorage.setItem(ORDERS_KEY, JSON.stringify(orders));
+      localStorage.setItem(CART_KEY, JSON.stringify(cart));
     }
-  }, [products, settings, orders, isLoading]);
+  }, [products, settings, orders, cart, isLoading]);
+
+  // Sync Logic
+  const handleSyncData = async () => {
+      if (!settings.googleScriptUrl) {
+          showToast('Vui lòng cấu hình URL Google Script', 'warning');
+          return;
+      }
+      setIsSyncing(true);
+      try {
+          const data = await fetchFromGoogleSheet(settings.googleScriptUrl);
+          if (data && data.products && data.orders) {
+              // Merge Logic: Local vs Cloud? For now, Cloud overwrites Local to ensure consistency across devices
+              setProducts(data.products);
+              setOrders(data.orders);
+              showToast('Đã đồng bộ dữ liệu mới nhất từ Cloud', 'success');
+          } else {
+              showToast('Không thể lấy dữ liệu từ Sheet', 'error');
+          }
+      } catch (e) {
+          showToast('Lỗi kết nối mạng', 'error');
+      } finally {
+          setIsSyncing(false);
+      }
+  };
 
   // Product Management
-  const handleAddProduct = (data: ProductFormData) => {
+  const handleAddProduct = async (data: ProductFormData) => {
     const newProduct: Product = {
       id: generateId(),
       createdAt: Date.now(),
@@ -179,25 +210,40 @@ const App: React.FC = () => {
     setProducts(prev => [newProduct, ...prev]);
     setActiveTab('products');
     showToast('Đã thêm sản phẩm mới');
+    
+    if (settings.googleScriptUrl) {
+        await syncProductToGoogleSheet(newProduct, 'add_product', settings.googleScriptUrl);
+    }
   };
 
-  const handleEditProduct = (data: ProductFormData) => {
+  const handleEditProduct = async (data: ProductFormData) => {
     if (!editingProduct) return;
+    const updatedProduct = { ...editingProduct, ...data };
+    
     setProducts(prev => 
-      prev.map(p => p.id === editingProduct.id ? { ...p, ...data } : p)
+      prev.map(p => p.id === editingProduct.id ? updatedProduct : p)
     );
     setEditingProduct(null);
     showToast('Đã cập nhật sản phẩm');
+
+    if (settings.googleScriptUrl) {
+        await syncProductToGoogleSheet(updatedProduct, 'update_product', settings.googleScriptUrl);
+    }
   };
 
-  const handleDeleteProduct = (id: string) => {
+  const handleDeleteProduct = async (id: string) => {
     if (currentUser?.role !== 'admin') {
         showToast('Chỉ quản lý được xóa sản phẩm!', 'error');
         return;
     }
     if (window.confirm('Xóa sản phẩm này?')) {
+      const product = products.find(p => p.id === id);
       setProducts(prev => prev.filter(p => p.id !== id));
       showToast('Đã xóa sản phẩm', 'warning');
+      
+      if (settings.googleScriptUrl && product) {
+         await syncProductToGoogleSheet(product, 'delete_product', settings.googleScriptUrl);
+      }
     }
   };
 
@@ -217,7 +263,13 @@ const App: React.FC = () => {
 
       setProducts(prev => prev.map(p => {
           if (stockUpdates.has(p.id)) {
-              return { ...p, stock: p.stock + (stockUpdates.get(p.id) || 0) };
+              // Update stock locally
+              const newStock = p.stock + (stockUpdates.get(p.id) || 0);
+              // Optimistically update cloud for each product affected
+              if (settings.googleScriptUrl) {
+                  syncProductToGoogleSheet({...p, stock: newStock}, 'update_product', settings.googleScriptUrl);
+              }
+              return { ...p, stock: newStock };
           }
           return p;
       }));
@@ -225,6 +277,8 @@ const App: React.FC = () => {
       // 2. Remove Order
       setOrders(prev => prev.filter(o => o.id !== orderId));
       showToast('Đã xóa đơn & hoàn kho', 'success');
+      
+      // Note: Delete order from Sheet is not implemented in V1 to preserve logs, can be added if needed
   };
 
   // Cart & POS Management
@@ -278,7 +332,7 @@ const App: React.FC = () => {
       employeeName: currentUser?.name || 'Không xác định' // Use logged in user name
     };
 
-    // 1. Update Inventory
+    // 1. Update Inventory Locally
     setProducts(prev => prev.map(p => {
       const cartItem = cart.find(c => c.id === p.id);
       if (cartItem) {
@@ -287,13 +341,23 @@ const App: React.FC = () => {
       return p;
     }));
 
-    // 2. Save Order
+    // 2. Save Order Locally
     setOrders(prev => [newOrder, ...prev]);
 
-    // 3. Sync to Google Sheets
+    // 3. Sync to Google Sheets (Order + Product Updates)
     let isSyncSuccess = true;
     if (settings.googleScriptUrl) {
+      // Sync the Order
       isSyncSuccess = await syncOrderToGoogleSheet(newOrder, settings.googleScriptUrl);
+      
+      // Sync updated stock for each product
+      cart.forEach(item => {
+          const product = products.find(p => p.id === item.id);
+          if (product) {
+              const newStock = product.stock - item.quantity;
+              syncProductToGoogleSheet({...product, stock: newStock}, 'update_product', settings.googleScriptUrl);
+          }
+      });
     }
 
     // 4. Notification
@@ -356,6 +420,19 @@ const App: React.FC = () => {
         </div>
         
         <div className="flex items-center gap-2">
+           {settings.googleScriptUrl && (
+             <button
+                onClick={handleSyncData}
+                disabled={isSyncing}
+                className="bg-white text-brand-blue px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-2 border border-blue-100 shadow-sm hover:bg-blue-50 transition-colors"
+             >
+                <div className={`${isSyncing ? 'animate-spin' : ''}`}>
+                    {isSyncing ? <RefreshCw className="w-4 h-4" /> : <Cloud className="w-4 h-4" />}
+                </div>
+                {isSyncing ? 'Đang bộ...' : 'Đồng bộ Cloud'}
+             </button>
+           )}
+           
            <div className="flex gap-1 bg-white p-1 rounded-xl border border-slate-200 shadow-sm">
             {['Hôm nay', 'Tuần này', 'Tháng'].map((label, idx) => {
                 const id = idx === 0 ? 'today' : idx === 1 ? 'week' : 'month';
@@ -626,6 +703,16 @@ const App: React.FC = () => {
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <h2 className="text-2xl font-bold text-slate-800">Kho hàng ({products.length})</h2>
                 <div className="flex gap-2">
+                    {settings.googleScriptUrl && (
+                        <button 
+                            onClick={handleSyncData}
+                            disabled={isSyncing}
+                            className="bg-white text-slate-600 border border-slate-200 px-3 py-2 rounded-xl font-bold flex items-center gap-2 shadow-sm hover:bg-slate-50"
+                        >
+                            <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} /> 
+                            <span className="hidden sm:inline">Đồng bộ</span>
+                        </button>
+                    )}
                     <div className="relative">
                         <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
                         <input 

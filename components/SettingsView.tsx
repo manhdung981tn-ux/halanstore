@@ -80,40 +80,92 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ settings, onSave }) 
     await sendTestToGoogleSheet(formData.googleScriptUrl);
     setTimeout(() => {
         setIsTesting(false);
-        alert('Đã gửi yêu cầu test! Hãy kiểm tra Google Sheet.');
+        alert('Đã gửi tín hiệu! (Lưu ý: Do chế độ bảo mật, web app không thể xác nhận thành công ngay lập tức. Hãy kiểm tra bên Sheet).');
     }, 1000);
   };
 
   const sampleScript = `
+// --- HÀ LAN STORE SYNC SCRIPT V4 ---
+function doGet(e) {
+  var action = e.parameter.action;
+  
+  if (action == 'get_all_data') {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var pSheet = ss.getSheetByName("Products");
+    var oSheet = ss.getSheetByName("Orders");
+    
+    var products = [];
+    if (pSheet && pSheet.getLastRow() > 1) {
+      var pData = pSheet.getRange(2, 1, pSheet.getLastRow() - 1, 7).getValues();
+      products = pData.map(r => ({
+        id: r[0], name: r[1], imageUrl: r[2], stock: Number(r[3]), costPrice: Number(r[4]), sellingPrice: Number(r[5]), createdAt: Number(r[6])
+      })).filter(p => p.id);
+    }
+    
+    var orders = [];
+    if (oSheet && oSheet.getLastRow() > 1) {
+      var oData = oSheet.getRange(2, 1, oSheet.getLastRow() - 1, 9).getValues();
+      orders = oData.map(r => ({
+        id: r[0], timestamp: Number(r[1]), employeeName: r[2], items: JSON.parse(r[3] || '[]'),
+        totalAmount: Number(r[5]), totalProfit: Number(r[6]), paymentMethod: r[7], paymentNote: r[8]
+      })).filter(o => o.id);
+    }
+    
+    return ContentService.createTextOutput(JSON.stringify({products: products, orders: orders}))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
 function doPost(e) {
   var lock = LockService.getScriptLock();
   lock.tryLock(10000);
   
   try {
-    var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var data = JSON.parse(e.postData.contents);
+    var action = data.action;
     
-    // Tự động tạo header nếu file mới
-    if (sheet.getLastRow() === 0) {
-      sheet.appendRow(["Thời gian", "Mã đơn", "Nhân viên", "Chi tiết hàng hóa", "Tổng tiền", "Lợi nhuận", "HTTT", "Chi tiết thanh toán"]);
+    // 1. ORDERS SHEET
+    var oSheet = ss.getSheetByName("Orders");
+    if (!oSheet) { oSheet = ss.insertSheet("Orders"); oSheet.appendRow(["ID", "Timestamp", "Nhân viên", "JSON Items", "Chi tiết", "Tổng tiền", "Lợi nhuận", "HTTT", "Ghi chú"]); }
+    
+    // 2. PRODUCTS SHEET
+    var pSheet = ss.getSheetByName("Products");
+    if (!pSheet) { pSheet = ss.insertSheet("Products"); pSheet.appendRow(["ID", "Tên SP", "Ảnh", "Tồn kho", "Giá vốn", "Giá bán", "Created"]); }
+
+    if (action == 'add_order') {
+       oSheet.appendRow([
+         data.orderId, data.timestamp, data.employeeName, data.items, 
+         data.itemsReadable, data.totalAmount, data.totalProfit, data.paymentMethod, data.paymentNote
+       ]);
+       // Giảm tồn kho sản phẩm tương ứng (Optional - App đã xử lý UI, nhưng ở đây xử lý cho chắc)
+    } 
+    
+    else if (action == 'add_product' || action == 'update_product') {
+       var rows = pSheet.getDataRange().getValues();
+       var found = false;
+       for (var i = 1; i < rows.length; i++) {
+         if (rows[i][0] == data.id) {
+            // Update
+            pSheet.getRange(i + 1, 1, 1, 7).setValues([[data.id, data.name, data.imageUrl, data.stock, data.costPrice, data.sellingPrice, data.createdAt]]);
+            found = true; break;
+         }
+       }
+       if (!found && action == 'add_product') {
+         pSheet.appendRow([data.id, data.name, data.imageUrl, data.stock, data.costPrice, data.sellingPrice, data.createdAt]);
+       }
     }
     
-    var data = JSON.parse(e.postData.contents);
-    sheet.appendRow([
-      data.date, 
-      data.orderId,
-      data.employeeName,
-      data.items, 
-      data.totalAmount, 
-      data.totalProfit,
-      data.paymentMethod,
-      data.paymentNote
-    ]);
+    else if (action == 'delete_product') {
+       var rows = pSheet.getDataRange().getValues();
+       for (var i = 1; i < rows.length; i++) {
+         if (rows[i][0] == data.id) { pSheet.deleteRow(i + 1); break; }
+       }
+    }
     
-    return ContentService.createTextOutput(JSON.stringify({result: "success"}))
-      .setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({result: "success"})).setMimeType(ContentService.MimeType.JSON);
   } catch (e) {
-    return ContentService.createTextOutput(JSON.stringify({result: "error", error: e}))
-      .setMimeType(ContentService.MimeType.JSON);
+    return ContentService.createTextOutput(JSON.stringify({result: "error", error: e.toString()})).setMimeType(ContentService.MimeType.JSON);
   } finally {
     lock.releaseLock();
   }
@@ -122,7 +174,7 @@ function doPost(e) {
 
   const copyScript = () => {
     navigator.clipboard.writeText(sampleScript);
-    alert('Đã sao chép mã Script mới!');
+    alert('Đã sao chép mã Script V4! Hãy dán vào Google Apps Script và Deploy lại.');
   };
 
   return (
@@ -201,12 +253,12 @@ function doPost(e) {
       <div className="bg-white rounded-2xl p-6 shadow-soft border border-slate-50">
         <h3 className="font-bold text-slate-800 mb-4 flex items-center gap-2">
           <FileSpreadsheet className="w-5 h-5 text-green-600" />
-          Kết nối Google Sheets
+          Đồng bộ Google Sheets (2 Chiều)
         </h3>
         
         <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-slate-600 mb-1">Google Apps Script URL</label>
+            <label className="block text-sm font-medium text-slate-600 mb-1">Google Apps Script URL (Deploy as Web App)</label>
             <div className="flex gap-2">
                 <input
                 type="url"
@@ -225,17 +277,20 @@ function doPost(e) {
                     ) : (
                         <>
                             <Zap className="w-4 h-4 mb-1 text-orange-500" />
-                            Test
+                            Kết nối
                         </>
                     )}
                 </button>
             </div>
+            <p className="text-[10px] text-slate-400 mt-1">
+                Lưu ý: Deploy ở chế độ "Execute as: Me" và "Who has access: Anyone".
+            </p>
           </div>
 
           <div className="bg-slate-50 rounded-xl p-4 border border-slate-100">
             <div className="flex justify-between items-center mb-2">
               <span className="text-xs font-bold text-slate-500 uppercase flex items-center gap-1">
-                <AlertCircle className="w-3 h-3" /> Mã Script mẫu (V3 - Có tên nhân viên)
+                <AlertCircle className="w-3 h-3" /> Mã Script V4 (Hỗ trợ Sync)
               </span>
               <button onClick={copyScript} className="text-brand-blue text-xs font-bold flex items-center gap-1 hover:underline">
                 <Copy className="w-3 h-3" /> Sao chép
@@ -245,7 +300,7 @@ function doPost(e) {
               {sampleScript}
             </pre>
             <div className="mt-2 text-[10px] text-orange-500 italic">
-                * Lưu ý: Hãy cập nhật lại Script để thêm cột "Nhân viên" và "Chi tiết thanh toán".
+                * Bạn cần tạo 2 sheet tên là "Products" và "Orders" trong file Google Sheet của bạn.
             </div>
           </div>
         </div>
